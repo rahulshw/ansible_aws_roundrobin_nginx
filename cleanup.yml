@@ -1,0 +1,57 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  user: root
+  pre_tasks:
+    - include_vars: variables.yml
+  tasks:
+    - name: Collect VPC info
+      ec2_vpc_net_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ vpc_name }}"
+      register: my_vpc
+
+    # saving VPC id to be used futher
+    - name:               Set VPC ID in variable
+      set_fact:
+        vpc_id:           "{{ my_vpc.vpcs[0].id }}"
+
+    - name: Collect info of application nodes
+      ec2_instance_info:
+        region:          "{{ aws_region }}"
+        filters:
+          vpc-id:        "{{ vpc_id }}"
+      register: ec2_instances
+
+    - name: debug
+      debug:
+        var: ec2_instances
+
+    - name: Delete ec2 instances
+      ec2:
+        region: "{{ aws_region }}"
+        state: "absent"
+        instance_ids: "{{ instances_ids|default([]) + [ item.get('instance_id') ] }}"
+      with_items: "{{ ec2_instances.instances }}"
+
+    - name: remove subnets and route tables from VPC
+      local_action:
+        module: ec2_vpc_net
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ aws_region }}"
+        state: present
+        resource_tags: "{}"
+        subnets: []
+        internet_gateway: False
+        route_tables: []
+        wait: yes
+
+    - name: Delete VPC
+      ec2_vpc_net:
+        state: "absent"
+        name: "{{ vpc_name }}"
+        region: "{{ aws_region }}"
+        cidr_block: "{{ my_vpc.vpcs[0].cidr_block }}"
+
