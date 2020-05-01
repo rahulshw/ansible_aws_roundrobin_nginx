@@ -1,0 +1,12 @@
+upstream dummy_load_balance {
+{% for backend_ip in backend_ips %}
+  server {{backend_ip}}:8484;
+{% endfor %}
+}
+
+server {
+  listen 80;
+  location / {
+    proxy_pass http://dummy_load_balance;
+  }
+}

@@ -1,0 +1,328 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  user: root
+  pre_tasks:
+    - include_vars: variables.yml
+  tasks:
+
+    # First task : creating the VPC.
+    - name:               Create VPC
+      ec2_vpc_net:
+        name:             "{{ vpc_name }}"
+        cidr_block:       "{{ vpc_cidr_block }}"
+        region:           "{{ aws_region }}"
+        state:            "present"
+
+      register: my_vpc
+
+    # saving VPC id to be used futher
+    - name:               Set VPC ID in variable
+      set_fact:
+        vpc_id:           "{{ my_vpc.vpc.id }}"
+
+    - name: debug
+      debug:
+        var: vpc_id
+
+    # Second task: creating subnet inside VPC
+    - name:               Create Subnet
+      ec2_vpc_subnet:
+         vpc_id:           "{{ vpc_id }}"
+         cidr:             "{{ subnet_1_cidr }}"
+         az:               "{{ aws_region }}a"
+         region:           "{{ aws_region }}"
+         resource_tags:
+           Name:           "{{ subnet_name }}"
+         state:            "present"
+      ignore_errors: True # Due to an ansible bug https://github.com/ansible/ansible/issues/64836
+
+    - name:               Gather subnet info 
+      ec2_vpc_subnet_info:
+        region:            "{{ aws_region }}"
+        filters:
+          vpc-id:           "{{ vpc_id }}"
+          "tag:Name":       "{{ subnet_name }}"
+      register: my_subnets # we expect only one subnet present for above filters
+
+    # We save the id of the Public Subnet in a new variable to be used further.
+    - name:         Set subnet id variable
+      set_fact:
+        my_subnet_id: "{{ my_subnets.subnets[0].id }}"
+
+    # printing out the VPC ID and subnet ID
+    - name: debug
+      debug:
+        msg: "{{ vpc_id }} {{ my_subnet_id }}"
+
+    
+    # Third task: creating an internet gateway for the VPC
+    - name:               Create Internet Gateway for VPC
+      ec2_vpc_igw:
+        vpc_id:           "{{ vpc_id }}"
+        region:           "{{ aws_region }}"
+        state:            "present"
+      register: my_vpc_igw
+
+
+    # We save the id of the Internet Gateway in a new variable.
+
+    - name:               Set Internet Gateway ID in variable
+      set_fact:
+        igw_id:           "{{ my_vpc_igw.gateway_id }}"
+
+
+
+    # Fourth task: creating a route table for intances to access internet
+    - name:               Set up subnet route table
+      ec2_vpc_route_table:
+        vpc_id:           "{{ vpc_id }}"
+        region:           "{{ aws_region }}"
+        tags:
+          Name:           "Public"
+        subnets:
+          - "{{ my_subnet_id }}"
+        routes:
+          - dest:         "0.0.0.0/0"
+            gateway_id:   "{{ igw_id }}"
+        state:            "present"
+
+
+    # Fifth task: creating security group for the application nodes
+    # allow ssh only from public ips
+    # allow communication to app port only from local ips
+    - name:               Create security group for backends
+      ec2_group:
+        name:             "Application"
+        description:      "allow ssh and application port"
+        vpc_id:           "{{ vpc_id }}"
+        region:           "{{ aws_region }}"
+        rules:
+          - proto:        "tcp"
+            from_port:    "22"
+            to_port:      "22"
+            cidr_ip:      "{{ my_ip_range }}"
+          - proto:        "tcp"
+            from_port:    "8484"
+            to_port:      "8484"
+            cidr_ip:      "{{ subnet_1_cidr }}"
+        state:            "present"
+      register: application_sg
+
+    # saving id in a variable
+    - name:               Set Security Group ID in variable
+      set_fact:
+        application_sg_id:  "{{ application_sg.group_id }}"
+
+
+    # Sixth task: creating security group for the application nodes
+    # allow ssh only from public ips
+    # allow communication to http port only from public ips
+    - name:               Create security group for webserver
+      ec2_group:
+        name:             "Webserver"
+        description:      "allow ssh and http port"
+        vpc_id:           "{{ vpc_id }}"
+        region:           "{{ aws_region }}"
+        rules:
+          - proto:        "tcp"
+            from_port:    "22"
+            to_port:      "22"
+            cidr_ip:      "{{ my_ip_range }}"
+          - proto:        "tcp"
+            from_port:    "80"
+            to_port:      "80"
+            cidr_ip:      "0.0.0.0/0"
+        state:            "present"
+      register: webserver_sg
+
+    # saving id in a variable
+    - name:
+      set_fact:
+        webserver_sg_id: "{{ webserver_sg.group_id }}"
+
+
+    # Seventh task: create application nodes
+    - name: Provision application nodes
+      ec2:
+        key_name:        "{{ key_name }}"
+        region:          "{{ aws_region }}"
+        instance_type:   "{{ instance_type }}"
+        image:           "{{ image_id }}"
+        vpc_subnet_id:   "{{ my_subnet_id }}"
+        group_id:       "{{ application_sg_id }}"
+        assign_public_ip: yes
+        wait: true
+        exact_count: 2
+        count_tag:
+          Name:         "{{ application_node_name }}"
+        instance_tags:
+          Name:         "{{ application_node_name }}"
+
+    # Eightth task: create webserver nodes
+    - name: Provision webserver node
+      ec2:
+        key_name:        "{{ key_name }}"
+        region:          "{{ aws_region }}"
+        instance_type:   "{{ instance_type }}"
+        image:           "{{ image_id }}"
+        vpc_subnet_id:   "{{ my_subnet_id }}"
+        group_id:        "{{ webserver_sg_id }}"
+        assign_public_ip: yes
+        wait: true
+        exact_count: 1
+        count_tag:
+          Name:         "{{ webserver_node_name }}"
+        instance_tags:
+          Name:         "{{ webserver_node_name }}"
+
+    # Save application node's private IPs to be used in nginx config
+    - name: Collect info of application nodes
+      ec2_instance_info:
+        region:          "{{ aws_region }}"
+        filters:
+          instance-state-name:         "running"
+          vpc-id:        "{{ vpc_id }}"
+          "tag:Name":       "{{ application_node_name }}"
+      register: application
+
+    - name: List of backend IPs
+      set_fact:
+        backend_ips:      "{{ backend_ips|default([]) + [ item.get('private_ip_address') ] }}"
+      with_items:         "{{ application.instances }}"
+
+
+    # Adding application node's public ip to a hostgroup
+    - name: Add application IPs to host group
+      add_host: 
+        hostname:         "{{ item.get('public_ip_address') }}"
+        groups:           "application_nodes"
+      with_items:         "{{ application.instances }}"
+
+
+    # Adding webserver node's public ip to a hostgroup
+    - name: Collect info of webserver nodes
+      ec2_instance_info:
+        region:          "{{ aws_region }}"
+        filters:
+          vpc-id:        "{{ vpc_id }}"
+          instance-state-name:         "running"
+          "tag:Name":       "webserver"
+      register: webserver
+
+    - name: Add webserver IP to host group
+      add_host: 
+        hostname:         "{{ item.get('public_ip_address') }}"
+        groups:           "webserver_nodes"
+      with_items:         "{{ webserver.instances }}"
+
+    - name: Save public ip of webserver
+      set_fact:
+        frontend_ip: "{{ webserver.instances[0].get('public_ip_address') }}"
+
+    - name: Print backend_ips
+      debug:
+        var: backend_ips
+
+
+    # waiting for newly created nodes to be sshable    
+    - name: Wait for nodes to become sshable
+      wait_for: 
+        host:             "{{ item.get('public_ip_address') }}"
+        port:             "22"
+      with_items:         "{{ webserver.instances + application.instances }}"
+
+
+- hosts: application_nodes
+  user: ubuntu
+  gather_facts: false
+  vars:
+    ansible_ssh_private_key_file: "/Users/rshaw/.ssh/personal_aws_key.pem"
+  tasks:
+    - name: Install golang-go
+      become: true
+      apt:
+        name: golang-go=2:1.10~4ubuntu1
+        update_cache: yes
+        state: present
+
+    - name: Install supervisor
+      become: true
+      apt:
+        name: supervisor=3.3.1-1.1
+        state: present
+
+    - name: Copy app code
+      become: true
+      copy:
+        src: app.go
+        dest: .
+
+    - name: Copy supervisor config
+      become: true
+      copy: 
+        src: app.supervisor.conf
+        dest: /etc/supervisor/conf.d/
+
+    - name: start application
+      become: true
+      command:
+        cmd: supervisorctl update
+
+
+- hosts: webserver_nodes
+  user: ubuntu
+  become: true
+  gather_facts: false
+  vars:
+    ansible_ssh_private_key_file: "/Users/rshaw/.ssh/personal_aws_key.pem"
+  tasks:
+    - name: gather backend_ips
+      set_fact:
+        backend_ips: "{{ hostvars['localhost']['backend_ips'] }}"
+    - name: Install nginx
+      apt:
+        name: nginx=1.14.0-0ubuntu1.7
+        update_cache: yes
+        state: present
+
+    - name: Remove default config
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Add loadbalance config
+      template:
+        src: load_balance.nginx.conf.j2
+        dest: /etc/nginx/sites-available/load_balance.conf
+
+    - name: Link loadbalance config
+      file:
+        state: link
+        src: /etc/nginx/sites-available/load_balance.conf
+        dest: /etc/nginx/sites-enabled/load_balance.conf
+
+      notify:
+      - restart nginx
+  handlers:
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
+
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  user: root
+  tasks:
+    - name: Print webserver public_ip_address
+      debug: "Webserver url: http://{{ frontend_ip }}"
+
+    - name: Test round robin
+      command:
+        cmd: "./test_roundrobin.py {{ frontend_ip }} {{ ','.join(backend_ips) }}"
+
+
+
+    
